@@ -898,13 +898,13 @@ if posArmed and not na(curSL)
         // OCA stop/limit pair. When a single candle contains both levels the broker
         // emulator resolves the ambiguity with its worst-case assumption - the stop.
         // That is exactly the Conservative behaviour.
-        strategy.exit("EXIT", from_entry = fromId, stop = curSL, limit = curTP,
+        strategy.exit("EXIT-" + fromId, from_entry = fromId, stop = curSL, limit = curTP,
            comment_profit = "TP", comment_loss = "SL")
     else
         // Optimistic: only the target is armed, so a candle holding both levels is
         // filled at the target. A candle that breaches the stop without touching the
         // target closes the position at that candle's close.
-        strategy.exit("EXIT", from_entry = fromId, limit = curTP, comment_profit = "TP")
+        strategy.exit("EXIT-" + fromId, from_entry = fromId, limit = curTP, comment_profit = "TP")
         if bar_index > nz(curTradeBar, bar_index)
             bool slHit = isL ? low  <= curSL : high >= curSL
             bool tpHit = isL ? high >= curTP : low  <= curTP
