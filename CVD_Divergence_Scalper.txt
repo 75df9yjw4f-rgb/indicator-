@@ -71,13 +71,25 @@ pivCmp = input.int(4, "Pivots To Compare", minval = 1, maxval = 20, group = G_ST
    tooltip = "THE search parameter. A new High is compared with the 4 nearest previous " +
              "Highs (H-1 ... H-4) and a new Low with the 4 nearest previous Lows. " +
              "Nothing older than that is used.")
-pLeft  = input.int(2, "Price swing Left", minval = 1, maxval = 20, group = G_ST, inline = "ps")
-pRight = input.int(2, "Right",            minval = 1, maxval = 20, group = G_ST, inline = "ps",
+pLeft  = input.int(10, "Price swing Left", minval = 1, maxval = 50, group = G_ST, inline = "ps")
+pRight = input.int(10, "Right",            minval = 1, maxval = 50, group = G_ST, inline = "ps",
    tooltip = "Only used to DETECT a structural swing on the price close and to confirm " +
-             "it: the swing exists after this many bars have closed to its right.")
-cLeft  = input.int(2, "CVD swing Left",   minval = 1, maxval = 20, group = G_ST, inline = "cs")
-cRight = input.int(2, "Right",            minval = 1, maxval = 20, group = G_ST, inline = "cs",
-   tooltip = "Same, applied to the CVD close series.")
+             "it: the swing exists after this many bars have closed to its right.\n\n" +
+             "THIS IS THE KNOB THAT CONTROLS HOW MANY SIGNALS YOU GET. Measured over " +
+             "3000 bars of 1m data, everything else at its default:\n" +
+             "  2/2   -> a pivot every 3.6 bars, a signal every ~16 bars (unusable noise)\n" +
+             "  5/5   -> a signal every ~36 bars\n" +
+             "  8/8   -> a signal every ~66 bars\n" +
+             " 10/10  -> a signal every ~92 bars  (default)\n" +
+             " 15/15  -> a signal every ~182 bars\n" +
+             "Lower it only if you want more signals. The cost of a bigger value is that " +
+             "the swing is confirmed this many bars after it happened - that delay is " +
+             "what keeps the indicator free of repainting.")
+cLeft  = input.int(10, "CVD swing Left",   minval = 1, maxval = 50, group = G_ST, inline = "cs")
+cRight = input.int(10, "Right",            minval = 1, maxval = 50, group = G_ST, inline = "cs",
+   tooltip = "Same, applied to the CVD close series. Keep it close to the price setting, " +
+             "otherwise price and CVD pivots stop landing inside the matching window and " +
+             "fewer pairs are found.")
 
 // ================================================================ 3 - DIVERGENCE =====
 string G_DV = "Divergence"
