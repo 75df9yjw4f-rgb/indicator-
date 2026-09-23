@@ -1,165 +1,149 @@
 // This Pine Script code is subject to the terms of the Mozilla Public License 2.0
-// CVD calculation is taken from "Cumulative Delta Volume" (CDV) by LonesomeTheBlue,
-// ported from Pine v4 to v6 without changing the formula.
+// CVD formula taken from "Cumulative Delta Volume" (CDV) by LonesomeTheBlue,
+// ported from Pine v4 to v6 without changing the math.
 // =====================================================================================
-//  CVD DIVERGENCE SCALPER  -  BTCUSDT 1m  -  indicator() only, no strategy
+//  CVD DIVERGENCE + EMA SIGNALS  -  BTCUSDT 1m  -  indicator() only
 // =====================================================================================
-//  ARCHITECTURE (what the script does, in order)
-//  ---------------------------------------------
-//   1. CVD is built exactly like LonesomeTheBlue's CDV: the volume of every chart candle
-//      is split into buy/sell parts by the candle's own shape (wicks + body), and the
-//      result is accumulated with ta.cum(). No lower-timeframe requests, no other CVD.
-//   2. The CVD candle is the original one: o = cvd[1], h = max(cvd, cvd[1]),
-//      l = min(cvd, cvd[1]), c = cvd. Heikin Ashi is an on/off display option.
-//   3. Structure is read from CLOSES only: price pivots from `close`, CVD pivots from
-//      the raw cumulative delta (CVD close). Wicks, HA values and intrabar extremes are
-//      never used for the comparison.
-//   4. Pivots come from ta.pivothigh/ta.pivotlow with separate Left/Right settings for
-//      price and for CVD. A pivot exists only after Right bars have closed -> no repaint.
-//   5. Confirmed pivots are stored in four small ring buffers: price highs, price lows,
-//      CVD highs, CVD lows.
-//   6. Every price pivot is matched with the CLOSEST confirmed CVD pivot of the SAME kind
-//      inside "Pivot Matching Window" bars. High only with High, Low only with Low.
-//   7. If the CVD pivot is confirmed LATER than the price pivot, the price pivot is left
-//      unmatched and picks its partner up at that later bar - never before.
-//   8. When a price pivot has its partner, the script walks back through the last N
-//      pivots of the same kind ("Historical Pivots To Scan", default 20) and takes the
-//      first structural mismatch it finds. Not just the previous pivot.
-//   9. Four types: 1 = HH/LH, 2 = LL/HL, 3 = HL/LL, 4 = LH/HH. Each can be switched off.
-//  10. The divergence is drawn twice: one thick line between the two price closes on the
-//      main chart, one thick line between the two CVD closes in the CVD pane, plus a
-//      small text tag. At most "Max Visible Divergences" (max 2) stay on the chart; the
-//      oldest drawing is deleted when a new one appears.
-//  11. The divergence HISTORY that drives the signals is kept separately as two bar
-//      numbers (last bullish-type / last bearish-type divergence), so deleting a drawing
-//      never deletes information.
-//  12. A divergence only arms the system. The trade event is ONE EMA cross that has to
-//      happen within "Max Bars After Divergence" bars (default 15).
-//  13. Signal Mode decides when the cross counts: after the candle closed (default, never
-//      repaints) or immediately on the cross (live bar only, see LIMITATION below).
-//  14. Divergence Direction Filter: Strict (HH/LH and LH/HH -> SHORT only, LL/HL and
-//      HL/LL -> LONG only) or Any (any live divergence, the EMA cross picks the side).
-//  15. A virtual position (FLAT / LONG / SHORT) is tracked: a signal in the opposite
-//      direction is always drawn, but it never opens a second position.
+//  ARCHITECTURE
+//  ------------
+//   1. CVD = LonesomeTheBlue's CDV, unchanged: the volume of every chart candle is split
+//      into buy/sell parts by the candle's own shape (wicks + body) and accumulated.
+//      No lower timeframe, no request.security_lower_tf(), no other reconstruction.
+//   2. CVD is drawn as candles (o = cvd[1], h = max(cvd, cvd[1]), l = min(cvd, cvd[1]),
+//      c = cvd). Heikin Ashi is a display option only and never touches the math below.
+//   3. DIVERGENCE USES CLOSES ONLY: price close against price close, CVD close against
+//      CVD close. Wicks, CVD high/low and Heikin Ashi values are never compared.
+//   4. Structural swings are detected with ta.pivothigh / ta.pivotlow on CLOSE. Left and
+//      Right only DETECT a swing and guarantee it is confirmed (Right bars must close
+//      first) - they are not the search parameter.
+//   5. THE search parameter is "Pivots To Compare" = 4: every new confirmed High is
+//      compared with the 4 nearest previous Highs (H-1, H-2, H-3, H-4) and every new Low
+//      with the 4 nearest previous Lows. Nothing older is looked at.
+//   6. High is only ever compared with High, Low only with Low.
+//   7. Each price pivot needs a partner: the closest confirmed CVD pivot of the same kind
+//      inside "Pivot Matching Window" (5 bars). No partner -> no divergence yet.
+//   8. If the CVD pivot is confirmed LATER than the price pivot, the pair is completed on
+//      that later bar - never earlier, so nothing is back-dated.
+//   9. Comparison order is nearest first: H-1, then H-2, then H-3, then H-4. The first
+//      valid mismatch wins and the scan stops - one new pivot draws at most one
+//      divergence.
+//  10. Four types: 1 = HH/LH, 2 = LL/HL, 3 = HL/LL, 4 = LH/HH, each switchable.
+//  11. Drawing: one thick line between the two price closes on the chart, one thick line
+//      between the two CVD closes in the CVD pane, plus a small type tag.
+//  12. At most "Max Visible Divergences" (2) stay drawn; the oldest is deleted. The bar
+//      numbers that feed the signal logic are stored separately, so nothing is lost.
+//  13. The divergence only arms the system. The signal is ONE EMA cross that must happen
+//      within "Max Bars After Divergence" (15) bars.
+//  14. Direction filter: Strict (HH/LH and LH/HH -> SHORT only, LL/HL and HL/LL -> LONG
+//      only) or Any (the EMA cross decides the side).
+//  15. Virtual position FLAT / LONG / SHORT. An opposite signal is always drawn; what it
+//      does to the state is set by "Opposite Signal Behavior" (default Ignore).
 //
 //  LIMITATION, stated openly
 //  -------------------------
-//  Pine cannot see intrabar price movement on historical bars, so a true "intrabar"
-//  cross cannot be reconstructed for history. "Immediately On Cross" therefore behaves
-//  exactly like "After Candle Close" on every historical bar, and only changes the LIVE
-//  bar, where the label may appear and disappear again before the bar closes. Nothing is
-//  simulated to hide this. For non-repainting signals keep the default mode.
+//  Pine has no intrabar data for historical bars, so an intrabar cross cannot be
+//  reconstructed for history. "Immediately On Cross" therefore behaves exactly like
+//  "After Candle Close" on every historical bar and only changes the LIVE bar, where the
+//  label may appear and vanish again before the bar closes. Nothing is simulated.
 // =====================================================================================
 
 //@version=6
-indicator("CVD Divergence Scalper [1m]", "CVD-DIV", overlay = false,
-  max_lines_count = 50, max_labels_count = 50)
+indicator("CVD Divergence + EMA Signals", "CVD-DIV", overlay = false,
+  max_lines_count = 20, max_labels_count = 20)
 
 // ======================================================================= 1 - CVD =====
 string G_CVD = "CVD"
 
-useHA      = input.bool(false, "Use Heikin Ashi CVD candles", group = G_CVD,
-   tooltip = "Display only. Heikin Ashi smooths the CVD candles but its values are not " +
-             "the real CVD close, so the divergence lines (which are drawn on the raw " +
-             "CVD closes) would no longer touch the candle bodies. Structure is ALWAYS " +
-             "measured on the raw CVD close, never on HA values or wicks.")
-showCvdC   = input.bool(true,  "Show CVD candles",  group = G_CVD)
-showCvdL   = input.bool(false, "Show CVD line",     group = G_CVD)
-colCvdUp   = input.color(#26a69a, "CVD candle up",   group = G_CVD, inline = "cvdcol")
-colCvdDn   = input.color(#ef5350, "down",            group = G_CVD, inline = "cvdcol")
-colCvdLine = input.color(#2962ff, "CVD line colour", group = G_CVD)
+useHA    = input.bool(false, "Heikin Ashi CVD candles (display only)", group = G_CVD,
+   tooltip = "Visual smoothing of the CVD candles. The divergence is always calculated " +
+             "on the raw CVD close, so with HA on the CVD divergence line no longer " +
+             "touches the candle bodies exactly.")
+colCvdUp = input.color(#26a69a, "CVD up", group = G_CVD, inline = "cv")
+colCvdDn = input.color(#ef5350, "down",   group = G_CVD, inline = "cv")
 
 // ================================================================= 2 - STRUCTURE =====
 string G_ST = "Structure"
 
-pLeft      = input.int(2, "Price Pivot Left",  minval = 1, maxval = 50, group = G_ST, inline = "pp")
-pRight     = input.int(2, "Right",             minval = 1, maxval = 50, group = G_ST, inline = "pp",
-   tooltip = "A price pivot is confirmed only after this many bars have closed to its " +
-             "right. Pivots are taken from CLOSE, not from high/low.")
-cLeft      = input.int(2, "CVD Pivot Left",    minval = 1, maxval = 50, group = G_ST, inline = "cp")
-cRight     = input.int(2, "Right",             minval = 1, maxval = 50, group = G_ST, inline = "cp",
-   tooltip = "Same rule for the CVD series, taken from the raw CVD close.")
-showPPiv   = input.bool(false, "Show price pivots", group = G_ST)
-showCPiv   = input.bool(true,  "Show CVD pivots",   group = G_ST)
+pivCmp = input.int(4, "Pivots To Compare", minval = 1, maxval = 20, group = G_ST,
+   tooltip = "THE search parameter. A new High is compared with the 4 nearest previous " +
+             "Highs (H-1 ... H-4) and a new Low with the 4 nearest previous Lows. " +
+             "Nothing older than that is used.")
+pLeft  = input.int(2, "Price swing Left", minval = 1, maxval = 20, group = G_ST, inline = "ps")
+pRight = input.int(2, "Right",            minval = 1, maxval = 20, group = G_ST, inline = "ps",
+   tooltip = "Only used to DETECT a structural swing on the price close and to confirm " +
+             "it: the swing exists after this many bars have closed to its right.")
+cLeft  = input.int(2, "CVD swing Left",   minval = 1, maxval = 20, group = G_ST, inline = "cs")
+cRight = input.int(2, "Right",            minval = 1, maxval = 20, group = G_ST, inline = "cs",
+   tooltip = "Same, applied to the CVD close series.")
 
 // ================================================================ 3 - DIVERGENCE =====
 string G_DV = "Divergence"
 
-histScan   = input.int(20, "Historical Pivots To Scan", minval = 1, maxval = 100, group = G_DV,
-   tooltip = "A new pivot is compared with the last N confirmed pivots of the same kind " +
-             "(High with High, Low with Low), walking backwards until the first " +
-             "structural mismatch is found - not only with the previous pivot.")
-matchWin   = input.int(5, "Pivot Matching Window (bars)", minval = 0, maxval = 30, group = G_DV,
+matchWin = input.int(5, "Pivot Matching Window (bars)", minval = 0, maxval = 30, group = G_DV,
    tooltip = "Price and CVD rarely pivot on the same candle. A price pivot takes the " +
              "closest confirmed CVD pivot of the same kind inside this many bars.")
-showT1     = input.bool(true, "Type 1   Price HH + CVD LH", group = G_DV)
-showT2     = input.bool(true, "Type 2   Price LL + CVD HL", group = G_DV)
-showT3     = input.bool(true, "Type 3   Price HL + CVD LL", group = G_DV)
-showT4     = input.bool(true, "Type 4   Price LH + CVD HH", group = G_DV)
-maxVis     = input.int(2, "Max Visible Divergences", minval = 1, maxval = 2, group = G_DV,
-   tooltip = "Hard limit. Older drawings are deleted, but the divergence history that " +
-             "drives the signals is kept.")
-showPDiv   = input.bool(true, "Draw divergence line on price", group = G_DV)
-showCDiv   = input.bool(true, "Draw divergence line on CVD",   group = G_DV)
-divWidth   = input.int(3, "Divergence Line Width", minval = 1, maxval = 6, group = G_DV)
-colBull    = input.color(#00c853, "Bullish type colour", group = G_DV, inline = "dcol")
-colBear    = input.color(#ff1744, "Bearish type",        group = G_DV, inline = "dcol")
+showT1   = input.bool(true, "Type 1   Price HH + CVD LH", group = G_DV)
+showT2   = input.bool(true, "Type 2   Price LL + CVD HL", group = G_DV)
+showT3   = input.bool(true, "Type 3   Price HL + CVD LL", group = G_DV)
+showT4   = input.bool(true, "Type 4   Price LH + CVD HH", group = G_DV)
+maxVis   = input.int(2, "Max Visible Divergences", minval = 1, maxval = 5, group = G_DV,
+   tooltip = "Older divergence drawings are deleted. The signal logic keeps its own " +
+             "history, so deleting a drawing never removes a signal.")
+divWidth = input.int(3, "Divergence Line Width", minval = 1, maxval = 6, group = G_DV)
+colBull  = input.color(#00c853, "Bullish type", group = G_DV, inline = "dc")
+colBear  = input.color(#ff1744, "Bearish type", group = G_DV, inline = "dc")
 
 // ======================================================================= 4 - EMA =====
 string G_EM = "EMA"
 
-showEma    = input.bool(true, "Show EMA", group = G_EM)
-emaLen     = input.int(20, "EMA Length", minval = 1, maxval = 500, group = G_EM)
-emaCol     = input.color(#ff9800, "EMA colour", group = G_EM, inline = "ema")
-emaWidth   = input.int(2, "width", minval = 1, maxval = 5, group = G_EM, inline = "ema")
+emaLen   = input.int(20, "EMA Length", minval = 1, maxval = 500, group = G_EM)
+emaCol   = input.color(#ff9800, "EMA colour", group = G_EM, inline = "em")
+emaWidth = input.int(2, "width", minval = 1, maxval = 5, group = G_EM, inline = "em")
 
 // =================================================================== 5 - SIGNALS =====
 string G_SG = "Signals"
 
 maxBarsAfter = input.int(15, "Max Bars After Divergence", minval = 1, maxval = 200, group = G_SG,
    tooltip = "The EMA cross must happen within this many bars after the divergence was " +
-             "confirmed, otherwise the divergence is no longer used.")
-sigMode    = input.string("After Candle Close", "Signal Mode",
+             "confirmed, otherwise that divergence is no longer used.")
+sigMode   = input.string("After Candle Close", "Signal Mode",
    options = ["After Candle Close", "Immediately On Cross"], group = G_SG,
-   tooltip = "After Candle Close: the candle must CLOSE on the other side of the EMA - " +
-             "non repainting. Immediately On Cross: the signal appears as soon as the " +
-             "cross happens on the live bar and can disappear again before that bar " +
-             "closes. Historical bars are identical in both modes because Pine has no " +
-             "intrabar data for them.")
-dirFilter  = input.string("Strict", "Divergence Direction Filter",
+   tooltip = "After Candle Close: the candle must close on the other side of the EMA - " +
+             "never repaints. Immediately On Cross: accepted as soon as the cross " +
+             "happens on the live bar; historical bars are identical in both modes.")
+dirFilter = input.string("Strict", "Divergence Direction Filter",
    options = ["Strict", "Any"], group = G_SG,
    tooltip = "Strict: HH/LH and LH/HH allow SHORT only, LL/HL and HL/LL allow LONG only. " +
-             "Any: any live divergence is enough and the EMA cross decides the side.")
-showSig    = input.bool(true, "Show Signals", group = G_SG)
-sigSize    = input.string("Small", "Signal size", options = ["Small", "Normal"], group = G_SG)
-closeOnOpp = input.bool(true, "Opposite signal closes the virtual position", group = G_SG,
-   tooltip = "ON: a LONG signal while SHORT is open sends the virtual position back to " +
-             "FLAT (it never opens the opposite position). OFF: the position stays open " +
-             "until an opposite signal arrives while flat is impossible - then it simply " +
-             "stays as it is.")
+             "Any: any live divergence counts and the EMA cross decides the side.")
+oppMode   = input.string("Ignore", "Opposite Signal Behavior",
+   options = ["Ignore", "Close Virtual Position"], group = G_SG,
+   tooltip = "Ignore (default): an opposite signal is drawn but the virtual position is " +
+             "left untouched. Close Virtual Position: it sends the state back to FLAT " +
+             "without opening the opposite side.")
 
 // =================================================================== 6 - VISUALS =====
 string G_VI = "Visuals"
 
-showEntry  = input.bool(true, "Show Entry",    group = G_VI)
-showPos    = input.bool(true, "Show Position", group = G_VI)
-entryCol   = input.color(#2962ff, "Entry colour", group = G_VI, inline = "ent")
-entryWidth = input.int(1, "width", minval = 1, maxval = 4, group = G_VI, inline = "ent")
+showSig   = input.bool(true, "Show Signals", group = G_VI)
+sigSize   = input.string("Small", "Signal size", options = ["Small", "Normal"], group = G_VI)
+showHist  = input.bool(true, "Show Historical Entries", group = G_VI,
+   tooltip = "Marks every virtual entry and keeps the entry line while the virtual " +
+             "position is open. Signals themselves always stay on the chart.")
+entryCol  = input.color(#2962ff, "Entry colour", group = G_VI, inline = "en")
+entryWdth = input.int(1, "width", minval = 1, maxval = 4, group = G_VI, inline = "en")
+showPivs  = input.bool(false, "Show pivot dots", group = G_VI)
 
 // =====================================================================================
-//  CVD ENGINE - ported 1:1 from "Cumulative Delta Volume" (CDV) by LonesomeTheBlue
+//  CVD  -  "Cumulative Delta Volume" (CDV) by LonesomeTheBlue, v4 -> v6, math unchanged
 // =====================================================================================
-//  The volume of EVERY CHART CANDLE is split into a buy part and a sell part by the
-//  shape of that candle - upper wick, lower wick and body:
-//      tw   = high - max(open, close)          upper wick
-//      bw   = min(open, close) - low           lower wick
+//      tw   = high - max(open, close)
+//      bw   = min(open, close) - low
 //      body = abs(close - open)
 //      rate(cond) = 0.5 * (tw + bw + (cond ? 2*body : 0)) / (tw + bw + body)
 //      deltaup   = volume * rate(open <= close)
 //      deltadown = volume * rate(open >  close)
 //      delta     = close >= open ? deltaup : -deltadown
 //      cvd       = cum(delta)
-//  Nothing else is used: no lower timeframe request, no reconstruction, no other CVD.
 // =====================================================================================
 
 float tw   = high - math.max(open, close)
@@ -173,38 +157,35 @@ rate(bool cond) =>
 float deltaUp   = nz(volume) * rate(open <= close)
 float deltaDown = nz(volume) * rate(open > close)
 float delta     = close >= open ? deltaUp : -deltaDown
-float cvd       = ta.cum(delta)                    // <- CVD CLOSE, the structure source
+float cvd       = ta.cum(delta)          // <- CVD CLOSE: the only value compared below
 
-// original CDV candle: o = cvd[1], h = max(cvd, cvd[1]), l = min(cvd, cvd[1]), c = cvd
+// original CDV candle
 float cvdO = nz(cvd[1], cvd)
 float cvdH = math.max(cvd, cvdO)
 float cvdL = math.min(cvd, cvdO)
-float cvdC = cvd
 
-// optional Heikin Ashi smoothing of the CVD candle (display only)
+// optional Heikin Ashi smoothing, display only
 var float haOpen = na
-float haClose = (cvdO + cvdH + cvdL + cvdC) / 4
-haOpen := na(haOpen[1]) ? (cvdO + cvdC) / 2 : (haOpen[1] + haClose[1]) / 2
+float haClose = (cvdO + cvdH + cvdL + cvd) / 4
+haOpen := na(haOpen[1]) ? (cvdO + cvd) / 2 : (haOpen[1] + haClose[1]) / 2
 float haHigh = math.max(cvdH, math.max(haOpen, haClose))
 float haLow  = math.min(cvdL, math.min(haOpen, haClose))
 
 float dO = useHA ? haOpen  : cvdO
 float dH = useHA ? haHigh  : cvdH
 float dL = useHA ? haLow   : cvdL
-float dC = useHA ? haClose : cvdC
+float dC = useHA ? haClose : cvd
 
-plotcandle(showCvdC ? dO : na, showCvdC ? dH : na, showCvdC ? dL : na, showCvdC ? dC : na,
-   "CVD candles", color = dC >= dO ? colCvdUp : colCvdDn,
+plotcandle(dO, dH, dL, dC, "CVD", color = dC >= dO ? colCvdUp : colCvdDn,
    bordercolor = dC >= dO ? colCvdUp : colCvdDn, wickcolor = color.new(color.gray, 30))
-plot(showCvdL ? cvdC : na, "CVD line", color = colCvdLine, linewidth = 2)
 hline(0, "CVD zero", color = color.new(color.gray, 70), linestyle = hline.style_dotted)
 
 // =====================================================================================
-//  STRUCTURE - pivots on CLOSES only
+//  STRUCTURE  -  swings on CLOSES, stored as confirmed pivots
 // =====================================================================================
-//  ta.pivothigh/ta.pivotlow return a value only after `right` bars have closed, and the
-//  pivot itself sits at bar_index - right. Nothing here can repaint and nothing can look
-//  into the future. Price uses `close`, CVD uses the raw cumulative delta close.
+//  ta.pivothigh / ta.pivotlow return a value only after `right` bars have closed; the
+//  pivot itself sits at bar_index - right. An unconfirmed swing never enters the arrays,
+//  so nothing can move afterwards and nothing looks into the future.
 // =====================================================================================
 
 float pPH = ta.pivothigh(close, pLeft, pRight)
@@ -216,21 +197,22 @@ int pBar = bar_index - pRight
 int cBar = bar_index - cRight
 
 type Piv
-    int   bar      // bar of the pivot candle
-    float val      // CLOSE value of that pivot (price close, or CVD close)
-    float cv       // matched CVD close, na while the CVD pivot is not confirmed yet
+    int   bar      // bar of the swing candle
+    float val      // CLOSE of that candle (price close, or CVD close)
+    float cv       // matched CVD close, na while its CVD pivot is not confirmed
     int   cvBar    // bar of the matched CVD pivot
 
-var array<Piv> phArr = array.new<Piv>()   // price pivot highs
-var array<Piv> plArr = array.new<Piv>()   // price pivot lows
-var array<Piv> chArr = array.new<Piv>()   // CVD pivot highs
-var array<Piv> clArr = array.new<Piv>()   // CVD pivot lows
+var array<Piv> phArr = array.new<Piv>()   // price highs
+var array<Piv> plArr = array.new<Piv>()   // price lows
+var array<Piv> chArr = array.new<Piv>()   // CVD highs
+var array<Piv> clArr = array.new<Piv>()   // CVD lows
 
 var array<line>  divLines  = array.new<line>()
 var array<label> divLabels = array.new<label>()
 
+// only the pivots that can still take part in a comparison are kept
 trimPiv(array<Piv> a) =>
-    while array.size(a) > histScan + 5
+    while array.size(a) > pivCmp + 5
         array.shift(a)
 
 // closest confirmed CVD pivot of the same kind inside the matching window, -1 if none
@@ -239,7 +221,7 @@ matchCvd(array<Piv> src, int b) =>
     int bestD = 1000000
     int n     = array.size(src)
     if n > 0
-        for i = n - 1 to math.max(0, n - 20)
+        for i = n - 1 to math.max(0, n - 10)
             int d = math.abs(array.get(src, i).bar - b)
             if d <= matchWin and d < bestD
                 bestD := d
@@ -247,22 +229,18 @@ matchCvd(array<Piv> src, int b) =>
     best
 
 // =====================================================================================
-//  DIVERGENCE ENGINE
+//  DIVERGENCE  -  new pivot against the 4 nearest previous pivots of the same kind
 // =====================================================================================
 //  Type 1 : Price HH + CVD LH      Type 3 : Price HL + CVD LL
 //  Type 2 : Price LL + CVD HL      Type 4 : Price LH + CVD HH
-//  All four are measured on CLOSES: price close pivot against price close pivot, CVD
-//  close pivot against CVD close pivot.
 // =====================================================================================
 
-// hard visual limit: only the newest `maxVis` divergences stay drawn
+// keeps only the newest `maxVis` divergences on the chart (2 lines + 2 labels each)
 trimDraw() =>
-    int per = (showPDiv ? 1 : 0) + (showCDiv ? 1 : 0)
-    if per > 0
-        while array.size(divLines) > maxVis * per
-            line.delete(array.shift(divLines))
-        while array.size(divLabels) > maxVis * per
-            label.delete(array.shift(divLabels))
+    while array.size(divLines) > maxVis * 2
+        line.delete(array.shift(divLines))
+    while array.size(divLabels) > maxVis * 2
+        label.delete(array.shift(divLabels))
 
 divTag(int t) => t == 1 ? "HH/LH" : t == 2 ? "LL/HL" : t == 3 ? "HL/LL" : "LH/HH"
 isBull(int t) => t == 2 or t == 3
@@ -271,29 +249,29 @@ isBear(int t) => t == 1 or t == 4
 drawDiv(Piv pn, Piv po, int t, bool isHigh) =>
     color  col = isBull(t) ? colBull : colBear
     string tag = divTag(t)
-    if showPDiv
-        array.push(divLines, line.new(po.bar, po.val, pn.bar, pn.val,
-           xloc = xloc.bar_index, color = col, width = divWidth, force_overlay = true))
-        array.push(divLabels, label.new(pn.bar, pn.val, tag, xloc = xloc.bar_index,
-           style = isHigh ? label.style_label_down : label.style_label_up,
-           color = color.new(col, 15), textcolor = color.white, size = size.tiny,
-           force_overlay = true))
-    if showCDiv
-        array.push(divLines, line.new(po.cvBar, po.cv, pn.cvBar, pn.cv,
-           xloc = xloc.bar_index, color = col, width = divWidth))
-        array.push(divLabels, label.new(pn.cvBar, pn.cv, tag, xloc = xloc.bar_index,
-           style = isHigh ? label.style_label_down : label.style_label_up,
-           color = color.new(col, 15), textcolor = color.white, size = size.tiny))
+    // price side: close of the old pivot -> close of the new pivot (never a wick)
+    array.push(divLines, line.new(po.bar, po.val, pn.bar, pn.val, xloc = xloc.bar_index,
+       color = col, width = divWidth, force_overlay = true))
+    array.push(divLabels, label.new(pn.bar, pn.val, tag, xloc = xloc.bar_index,
+       style = isHigh ? label.style_label_down : label.style_label_up,
+       color = color.new(col, 15), textcolor = color.white, size = size.tiny,
+       force_overlay = true))
+    // CVD side: CVD close -> CVD close
+    array.push(divLines, line.new(po.cvBar, po.cv, pn.cvBar, pn.cv, xloc = xloc.bar_index,
+       color = col, width = divWidth))
+    array.push(divLabels, label.new(pn.cvBar, pn.cv, tag, xloc = xloc.bar_index,
+       style = isHigh ? label.style_label_down : label.style_label_up,
+       color = color.new(col, 15), textcolor = color.white, size = size.tiny))
     trimDraw()
 
-// walks back through the last N pivots of the same kind and takes the FIRST structural
-// mismatch it finds. Returns the divergence type, 0 when there is none.
+// compares the pivot at index k with the `pivCmp` nearest previous pivots, nearest
+// first, and stops at the first valid mismatch -> one new pivot, at most one divergence
 scanDiv(array<Piv> pArr, bool isHigh, int k) =>
     int typ = 0
     if k >= 1
         Piv pn = array.get(pArr, k)
         if not na(pn.cv)
-            for j = k - 1 to math.max(0, k - histScan)
+            for j = k - 1 to math.max(0, k - pivCmp)
                 Piv po = array.get(pArr, j)
                 if not na(po.cv)
                     bool pUp = pn.val > po.val
@@ -313,7 +291,7 @@ scanDiv(array<Piv> pArr, bool isHigh, int k) =>
                         break
     typ
 
-// a confirmed PRICE pivot: store it, match it with an already confirmed CVD pivot, scan
+// a confirmed PRICE pivot: store it, match it with a confirmed CVD pivot, compare
 addPrice(array<Piv> pArr, array<Piv> cArr, int b, float v, bool isHigh) =>
     Piv p = Piv.new(b, v, na, na)
     int m = matchCvd(cArr, b)
@@ -326,15 +304,15 @@ addPrice(array<Piv> pArr, array<Piv> cArr, int b, float v, bool isHigh) =>
     scanDiv(pArr, isHigh, array.size(pArr) - 1)
 
 // a confirmed CVD pivot: store it and hand it to the newest price pivot that is still
-// waiting for a partner inside the matching window. This is the ONLY way a price pivot
-// can get a CVD pivot that was confirmed later - never before that bar.
+// waiting for a partner inside the window. This is the only way a price pivot can get a
+// CVD pivot that was confirmed later, and it happens on that later bar - not before.
 addCvd(array<Piv> cArr, array<Piv> pArr, int b, float v, bool isHigh) =>
     array.push(cArr, Piv.new(b, v, na, na))
     trimPiv(cArr)
     int typ = 0
     int n = array.size(pArr)
     if n > 0
-        for i = n - 1 to math.max(0, n - 10)
+        for i = n - 1 to math.max(0, n - 5)
             Piv pp = array.get(pArr, i)
             if na(pp.cv) and math.abs(pp.bar - b) <= matchWin
                 pp.cv    := v
@@ -343,8 +321,7 @@ addCvd(array<Piv> cArr, array<Piv> pArr, int b, float v, bool isHigh) =>
                 break
     typ
 
-// CVD pivots are processed first, so a price pivot confirmed on the same bar can already
-// use them; the reverse case is handled by addCvd().
+// CVD pivots first, so a price pivot confirmed on the same bar can already use them
 int tA = 0
 int tB = 0
 int tC = 0
@@ -364,15 +341,12 @@ bool divBear = isBear(tA) or isBear(tB) or isBear(tC) or isBear(tD)
 // =====================================================================================
 //  EMA  +  SIGNALS
 // =====================================================================================
-//  The divergence only ARMS the system. The signal is the EMA cross that happens within
-//  "Max Bars After Divergence" bars after the divergence was confirmed. Only ONE EMA.
-//  The two bar numbers below are the divergence history used by the signal logic - they
-//  survive even when the drawing of that divergence was deleted by the 2-line limit.
+//  The divergence only arms the system; the signal is the EMA cross inside the window.
+//  These two bar numbers are the signal history and survive the 2-drawing limit.
 // =====================================================================================
 
-var int lastBull = na    // bar of the newest bullish-type divergence (LL/HL, HL/LL)
-var int lastBear = na    // bar of the newest bearish-type divergence (HH/LH, LH/HH)
-
+var int lastBull = na
+var int lastBear = na
 if divBull
     lastBull := bar_index
 if divBear
@@ -385,9 +359,8 @@ float emaVal  = ta.ema(close, emaLen)
 bool  crossUp = ta.crossover(close, emaVal)
 bool  crossDn = ta.crossunder(close, emaVal)
 
-// "After Candle Close" waits for the bar to close -> the signal can never repaint.
-// "Immediately On Cross" accepts the cross on the live bar; on historical bars Pine has
-// no intrabar data, so there both modes produce exactly the same signals.
+// "After Candle Close" waits for the bar to close -> non repainting. "Immediately On
+// Cross" accepts it on the live bar; historical bars are identical in both modes.
 bool gate  = sigMode == "After Candle Close" ? barstate.isconfirmed : true
 bool emaUp = crossUp and gate
 bool emaDn = crossDn and gate
@@ -399,23 +372,23 @@ bool longSig  = emaUp and longOk
 bool shortSig = emaDn and shortOk
 
 // =====================================================================================
-//  VIRTUAL POSITION  -  FLAT / LONG / SHORT, never both
+//  VIRTUAL POSITION  -  FLAT / LONG / SHORT
 // =====================================================================================
-var int   pos        = 0    //  0 = FLAT, 1 = LONG, -1 = SHORT
+var int   pos        = 0        //  0 = FLAT, 1 = LONG, -1 = SHORT
 var float entryPrice = na
 
 if longSig
     if pos == 0
         pos        := 1
         entryPrice := close
-    else if pos == -1 and closeOnOpp
+    else if pos == -1 and oppMode == "Close Virtual Position"
         pos        := 0
         entryPrice := na
 if shortSig
     if pos == 0
         pos        := -1
         entryPrice := close
-    else if pos == 1 and closeOnOpp
+    else if pos == 1 and oppMode == "Close Virtual Position"
         pos        := 0
         entryPrice := na
 
@@ -424,40 +397,38 @@ bool newEntry = pos != 0 and pos != nz(pos[1])
 // =====================================================================================
 //  VISUALS
 // =====================================================================================
-plot(showEma ? emaVal : na, "EMA", color = emaCol, linewidth = emaWidth,
-   force_overlay = true)
+plot(emaVal, "EMA", color = emaCol, linewidth = emaWidth, force_overlay = true)
 
-// plotshape() needs a constant size, so each signal exists as a small and a normal
-// version and the input picks which one is drawn.
+// plotshape() needs a constant size, so every signal exists in a small and a normal
+// version and the input decides which one is drawn. Signals are never deleted.
 bool sigSmall = sigSize == "Small"
-plotshape(showSig and longSig and sigSmall, "LONG signal (small)", shape.triangleup,
+plotshape(showSig and longSig and sigSmall, "LONG (small)", shape.triangleup,
    location.belowbar, colBull, text = "LONG", textcolor = colBull, size = size.small,
    force_overlay = true)
-plotshape(showSig and longSig and not sigSmall, "LONG signal (normal)", shape.triangleup,
+plotshape(showSig and longSig and not sigSmall, "LONG (normal)", shape.triangleup,
    location.belowbar, colBull, text = "LONG", textcolor = colBull, size = size.normal,
    force_overlay = true)
-plotshape(showSig and shortSig and sigSmall, "SHORT signal (small)", shape.triangledown,
+plotshape(showSig and shortSig and sigSmall, "SHORT (small)", shape.triangledown,
    location.abovebar, colBear, text = "SHORT", textcolor = colBear, size = size.small,
    force_overlay = true)
-plotshape(showSig and shortSig and not sigSmall, "SHORT signal (normal)", shape.triangledown,
+plotshape(showSig and shortSig and not sigSmall, "SHORT (normal)", shape.triangledown,
    location.abovebar, colBear, text = "SHORT", textcolor = colBear, size = size.normal,
    force_overlay = true)
 
-// entry marker + the line that stays while the virtual position is open
-plotshape(showEntry and newEntry ? entryPrice : na, "Entry", shape.xcross,
+// virtual entries: a permanent mark at every entry + the line while the position is open
+plotshape(showHist and newEntry ? entryPrice : na, "Entry", shape.xcross,
    location.absolute, entryCol, size = size.tiny, force_overlay = true)
-plot(showPos and pos != 0 ? entryPrice : na, "Position entry", color = entryCol,
-   linewidth = entryWidth, style = plot.style_linebr, force_overlay = true)
+plot(showHist and pos != 0 ? entryPrice : na, "Virtual position", color = entryCol,
+   linewidth = entryWdth, style = plot.style_linebr, force_overlay = true)
 
-// pivot dots (offset puts them back on the pivot candle, they appear only once the pivot
-// is confirmed, so nothing moves afterwards)
-plotshape(showPPiv ? pPH : na, "Price pivot high", shape.circle, location.absolute,
+// pivot dots, drawn back on the swing candle once it is confirmed
+plotshape(showPivs ? pPH : na, "Price pivot high", shape.circle, location.absolute,
    color.new(#787b86, 0), offset = -pRight, size = size.tiny, force_overlay = true)
-plotshape(showPPiv ? pPL : na, "Price pivot low", shape.circle, location.absolute,
+plotshape(showPivs ? pPL : na, "Price pivot low", shape.circle, location.absolute,
    color.new(#787b86, 0), offset = -pRight, size = size.tiny, force_overlay = true)
-plotshape(showCPiv ? cPH : na, "CVD pivot high", shape.circle, location.absolute,
+plotshape(showPivs ? cPH : na, "CVD pivot high", shape.circle, location.absolute,
    color.new(#b2b5be, 0), offset = -cRight, size = size.tiny)
-plotshape(showCPiv ? cPL : na, "CVD pivot low", shape.circle, location.absolute,
+plotshape(showPivs ? cPL : na, "CVD pivot low", shape.circle, location.absolute,
    color.new(#b2b5be, 0), offset = -cRight, size = size.tiny)
 
 alertcondition(longSig,  "LONG signal",  "CVD divergence + EMA cross up")
