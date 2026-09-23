@@ -32,10 +32,11 @@
 //      between the two CVD closes in the CVD pane, plus a small type tag.
 //  12. At most "Max Visible Divergences" (2) stay drawn; the oldest is deleted. The bar
 //      numbers that feed the signal logic are stored separately, so nothing is lost.
-//  13. The divergence only arms the system: it creates ONE pending wait. The FIRST
-//      matching EMA cross inside "Max Bars After Divergence" (15) fires ONE signal and
-//      uses that wait up - later crosses stay silent until a NEW divergence appears. If
-//      no matching cross arrives inside the window, the wait expires without a signal.
+//  13. The divergence only arms the system: it opens ONE waiting (activeLongWaiting or
+//      activeShortWaiting). The FIRST matching EMA cross inside "Max Bars After
+//      Divergence" (15) fires ONE signal and closes the waiting completely, so every
+//      later cross is ignored until a NEW divergence opens a new waiting. A waiting that
+//      sees no matching cross inside its window expires without a signal.
 //  14. Direction filter: Strict (HH/LH and LH/HH -> SHORT only, LL/HL and HL/LL -> LONG
 //      only) or Any (the EMA cross decides the side).
 //  15. Virtual position FLAT / LONG / SHORT. An opposite signal is always drawn; what it
@@ -343,38 +344,42 @@ bool divBear = isBear(tA) or isBear(tB) or isBear(tC) or isBear(tD)
 // =====================================================================================
 //  EMA  +  SIGNALS
 // =====================================================================================
-//  A confirmed divergence creates exactly ONE pending wait. That wait is resolved by the
-//  FIRST matching EMA cross, which fires ONE signal and immediately uses the wait up.
-//  Every further EMA cross is ignored until a NEW divergence arrives. If no matching
-//  cross happens within "Max Bars After Divergence", the wait simply expires unused.
+//  ONE DIVERGENCE = AT MOST ONE SIGNAL.
 //
-//      pendBar   = bar on which the wait was created, na = no wait is running
-//      pendLong  = this wait is allowed to produce a LONG
-//      pendShort = this wait is allowed to produce a SHORT
+//  activeLongWaiting / activeShortWaiting ARE the whole signal state:
+//    * they are set to true ONLY by a NEW confirmed divergence that allows that side;
+//    * the FIRST matching EMA cross fires one signal and closes BOTH of them;
+//    * they also go false when Max Bars After Divergence has passed without a cross.
+//  An EMA cross while both are false is never a signal, so the second, third, fourth
+//  cross after a signal stays silent until a NEW divergence opens a new waiting.
 // =====================================================================================
 
-var int  pendBar   = na
-var bool pendLong  = false
-var bool pendShort = false
+var bool activeLongWaiting  = false
+var bool activeShortWaiting = false
+var int  longWaitBar        = na   // bar the LONG waiting was opened on
+var int  shortWaitBar       = na   // bar the SHORT waiting was opened on
 
-// ---- 1. a NEW confirmed divergence creates ONE pending wait (it replaces an older,
-//         still unused one - the newest divergence is the one being waited on).
-//         Strict: a bullish type waits for a LONG only, a bearish type for a SHORT only.
-//         Any:    the wait accepts whichever side the EMA crosses first.
-if divBull or divBear
-    pendBar := bar_index
-    if dirFilter == "Strict"
-        pendLong  := divBull
-        pendShort := divBear
-    else
-        pendLong  := true
-        pendShort := true
+// ---- (1) a NEW confirmed divergence opens ONE waiting, for its own direction only ----
+//          Strict : bullish type -> LONG waiting, bearish type -> SHORT waiting
+//          Any    : the divergence opens both and the EMA decides which one is used
+bool armLong  = dirFilter == "Strict" ? divBull : (divBull or divBear)
+bool armShort = dirFilter == "Strict" ? divBear : (divBull or divBear)
 
-// ---- 2. the wait expires when the window is over. It is NOT extended by anything.
-if not na(pendBar) and bar_index - pendBar > maxBarsAfter
-    pendBar   := na
-    pendLong  := false
-    pendShort := false
+if armLong
+    activeLongWaiting := true
+    longWaitBar       := bar_index
+if armShort
+    activeShortWaiting := true
+    shortWaitBar       := bar_index
+
+// ---- (2) expiry: no matching cross inside Max Bars After Divergence -> waiting dies.
+//          The window is never extended and an EMA cross never reopens it.
+if activeLongWaiting and bar_index - longWaitBar > maxBarsAfter
+    activeLongWaiting := false
+    longWaitBar       := na
+if activeShortWaiting and bar_index - shortWaitBar > maxBarsAfter
+    activeShortWaiting := false
+    shortWaitBar       := na
 
 float emaVal  = ta.ema(close, emaLen)
 bool  crossUp = ta.crossover(close, emaVal)
@@ -386,18 +391,18 @@ bool gate  = sigMode == "After Candle Close" ? barstate.isconfirmed : true
 bool emaUp = crossUp and gate
 bool emaDn = crossDn and gate
 
-// ---- 3. the FIRST matching cross inside a running wait is the signal. A cross without
-//         a running wait is never a signal.
-bool armed    = not na(pendBar)
-bool longSig  = armed and pendLong  and emaUp
-bool shortSig = armed and pendShort and emaDn
+// ---- (3) the FIRST matching cross inside an active waiting is the signal. The cross
+//          alone is never enough - the waiting has to be open.
+bool longSig  = activeLongWaiting  and emaUp
+bool shortSig = activeShortWaiting and emaDn
 
-// ---- 4. the wait is used up by that signal: no second signal from the same divergence,
-//         whatever the EMA does afterwards, until a NEW divergence arms a new wait.
+// ---- (4) the signal CLOSES the waiting completely. Every later EMA cross, in either
+//          direction, is ignored until a NEW confirmed divergence opens a new waiting.
 if longSig or shortSig
-    pendBar   := na
-    pendLong  := false
-    pendShort := false
+    activeLongWaiting  := false
+    activeShortWaiting := false
+    longWaitBar        := na
+    shortWaitBar       := na
 
 // =====================================================================================
 //  VIRTUAL POSITION  -  FLAT / LONG / SHORT
